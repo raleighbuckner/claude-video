@@ -48,6 +48,49 @@ class TestPlanChunks:
         plan = whisper.plan_chunks(total_seconds=0.0, total_bytes=0, max_bytes=24 * MB)
         assert plan == [(0.0, 0.0)]
 
+    def test_time_cap_splits_when_bytes_fit_but_duration_exceeds(self):
+        # 34 min / 16 MB fits the 24 MB byte cap but exceeds a 15-min time cap →
+        # ceil(2040/900) = 3 chunks. This is the case that caused the retry spiral.
+        plan = whisper.plan_chunks(
+            total_seconds=2040.0, total_bytes=16 * MB, max_bytes=24 * MB, max_seconds=900.0
+        )
+        assert len(plan) == 3
+
+    def test_uses_larger_of_byte_and_time_split(self):
+        # bytes need ceil(71/24)=3, time needs ceil(1000/900)=2 → the larger, 3.
+        plan = whisper.plan_chunks(
+            total_seconds=1000.0, total_bytes=71 * MB, max_bytes=24 * MB, max_seconds=900.0
+        )
+        assert len(plan) == 3
+
+    def test_time_cap_none_is_size_only(self):
+        # No time cap: a long-but-small file stays a single chunk (old behavior).
+        plan = whisper.plan_chunks(
+            total_seconds=3600.0, total_bytes=5 * MB, max_bytes=24 * MB, max_seconds=None
+        )
+        assert plan == [(0.0, 3600.0)]
+
+    def test_time_cap_zero_disables_time_split(self):
+        plan = whisper.plan_chunks(
+            total_seconds=3600.0, total_bytes=5 * MB, max_bytes=24 * MB, max_seconds=0
+        )
+        assert plan == [(0.0, 3600.0)]
+
+    def test_time_split_chunks_are_contiguous_and_cover_full_duration(self):
+        total = 2040.0
+        plan = whisper.plan_chunks(total, 16 * MB, 24 * MB, max_seconds=900.0)
+        assert plan[0][0] == 0.0
+        for (off, dur), (next_off, _) in zip(plan, plan[1:]):
+            assert math.isclose(off + dur, next_off)
+        last_off, last_dur = plan[-1]
+        assert math.isclose(last_off + last_dur, total)
+
+    def test_each_time_capped_chunk_under_duration_cap(self):
+        cap = 900.0
+        plan = whisper.plan_chunks(2040.0, 16 * MB, 24 * MB, max_seconds=cap)
+        for _off, dur in plan:
+            assert dur <= cap
+
 
 class TestShiftSegments:
     def test_adds_offset_to_start_and_end(self):

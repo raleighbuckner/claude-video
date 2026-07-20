@@ -37,22 +37,80 @@ OPENAI_MODEL = "whisper-1"
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
+# Per-request HTTP timeout and per-chunk duration cap. Both are env-overridable
+# (WHISPER_TIMEOUT / WHISPER_CHUNK_SECONDS) — a local GPU server transcribing a
+# long file in one upload can exceed the old hardcoded 300s, and when it did the
+# retry logic re-POSTed and the server ran a duplicate concurrent job. Splitting
+# by time (not just size) keeps each request short; a generous timeout keeps a
+# long single upload from ever tripping a retry.
+DEFAULT_REQUEST_TIMEOUT = 300.0
+DEFAULT_MAX_CHUNK_SECONDS = 900.0  # 15 min
+
+
+def _positive_float_setting(name: str, default: float, *, zero_ok: bool = False) -> float:
+    """Read a float setting, falling back to default on missing/invalid input.
+
+    With zero_ok, a value of 0 is returned as-is (used to mean "disabled");
+    otherwise 0 and negatives fall back to the default.
+    """
+    raw = read_setting(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value < 0:
+        return default
+    if value == 0:
+        return 0.0 if zero_ok else default
+    return value
+
+
+def _request_timeout() -> float:
+    """Per-request HTTP timeout in seconds (WHISPER_TIMEOUT, default 300).
+
+    Raise this above your worst-case job time so a long local transcription
+    never times out and triggers a duplicate-creating retry. Blank/invalid/
+    non-positive → the 300s default.
+    """
+    return _positive_float_setting("WHISPER_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
+
+
+def _max_chunk_seconds() -> float:
+    """Max seconds of audio per upload (WHISPER_CHUNK_SECONDS, default 900).
+
+    Long files are split by time as well as size so each request stays short and
+    finishes well within the timeout. Set to 0 to disable time-based splitting
+    (size-only — the pre-existing behavior). Blank/invalid → the 900s default.
+    """
+    return _positive_float_setting("WHISPER_CHUNK_SECONDS", DEFAULT_MAX_CHUNK_SECONDS, zero_ok=True)
+
 
 def plan_chunks(
     total_seconds: float,
     total_bytes: int,
     max_bytes: int = MAX_UPLOAD_BYTES,
+    max_seconds: float | None = None,
 ) -> list[tuple[float, float]]:
-    """Split a duration into contiguous (offset, duration) chunks under max_bytes.
+    """Split a duration into contiguous (offset, duration) chunks.
 
-    Size scales linearly with duration (constant-bitrate mono mp3), so an even
-    time split yields evenly-sized chunks. Returns a single full-length chunk
-    when the audio already fits.
+    A chunk must fit under both max_bytes and (when set) max_seconds. Size scales
+    linearly with duration (constant-bitrate mono mp3), so an even time split
+    yields evenly-sized chunks. Returns a single full-length chunk when the audio
+    already fits both limits. max_seconds=None or 0 disables the time cap.
     """
-    if total_bytes <= max_bytes or total_seconds <= 0:
+    if total_seconds <= 0:
         return [(0.0, total_seconds)]
 
-    n = math.ceil(total_bytes / max_bytes)
+    fits_bytes = total_bytes <= max_bytes
+    fits_time = not max_seconds or total_seconds <= max_seconds
+    if fits_bytes and fits_time:
+        return [(0.0, total_seconds)]
+
+    n_bytes = math.ceil(total_bytes / max_bytes) if max_bytes > 0 else 1
+    n_time = math.ceil(total_seconds / max_seconds) if max_seconds else 1
+    n = max(n_bytes, n_time, 1)
     chunk = total_seconds / n
     plan: list[tuple[float, float]] = []
     for i in range(n):
@@ -290,6 +348,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     }
 
     context = ssl.create_default_context()
+    timeout = _request_timeout()
     rate_limit_hits = 0
     last_exc: Exception | None = None
     last_detail = ""
@@ -297,7 +356,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     for attempt in range(MAX_ATTEMPTS):
         request = Request(endpoint, data=body, headers=headers, method="POST")
         try:
-            with urlopen(request, timeout=300, context=context) as response:
+            with urlopen(request, timeout=timeout, context=context) as response:
                 payload = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = _read_error_body(exc)
@@ -489,18 +548,18 @@ def transcribe_video(
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    duration = audio_duration(audio_path)
+    plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES, _max_chunk_seconds())
+    if len(plan) == 1:
         print(
             f"[watch] audio: {audio_bytes / 1024:.0f} kB — sending to {label} Whisper…",
             file=sys.stderr,
         )
         segments = transcribe_one(audio_path)
     else:
-        duration = audio_duration(audio_path)
-        plan = plan_chunks(duration, audio_bytes, MAX_UPLOAD_BYTES)
         print(
-            f"[watch] audio: {audio_bytes / (1024 * 1024):.0f} MB exceeds "
-            f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — splitting into {len(plan)} chunks…",
+            f"[watch] audio: {audio_bytes / (1024 * 1024):.1f} MB / {duration / 60:.0f} min — "
+            f"splitting into {len(plan)} chunks…",
             file=sys.stderr,
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)

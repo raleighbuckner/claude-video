@@ -12,9 +12,10 @@ def clean_env(monkeypatch, tmp_path):
     for name in ("WHISPER_BASE_URL", "WHISPER_MODEL", "WHISPER_API_KEY",
                  "GROQ_API_KEY", "OPENAI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
-    # Point HOME at an empty dir so ~/.config/watch/.env cannot leak in,
-    # and cwd at an empty dir so ./.env cannot either.
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # Path.home() honors $HOME on POSIX but $USERPROFILE on Windows; patch the
+    # method itself so ~/.config/watch/.env can't leak in on either OS. cwd is
+    # pointed at an empty dir so ./.env can't either.
+    monkeypatch.setattr(whisper.Path, "home", lambda: tmp_path)
     monkeypatch.chdir(tmp_path)
 
 
